@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b1020" />
+    <title>Calc AST PWA</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body { margin:0; font-family: Inter, system-ui, sans-serif; background:#0b1020; color:#e9edf7; }
+      .app { min-height:100vh; padding-top:70px; padding-bottom:320px; }
+      .topbar { position:fixed; top:0; left:0; right:0; z-index:20; background:#111935; border-bottom:1px solid #2a3768; display:flex; gap:8px; padding:10px; align-items:center; }
+      .topbar input{ flex:1; min-width:120px; border-radius:10px; border:1px solid #3a4a88; background:#09112a; color:#e9edf7; padding:9px 10px; }
+      button{ border:none; border-radius:10px; background:#2c3f84; color:#fff; padding:8px 10px; font-weight:600; cursor:pointer; transition: all .16s ease; }
+      button:hover{ filter:brightness(1.12); }
+      button:active{ transform:translateY(1px) scale(.98); }
+      .container{ max-width:920px; margin:0 auto; padding:12px; }
+      .panel{ background:#121b3b; border:1px solid #304184; border-radius:16px; padding:14px; margin-bottom:12px; }
+      .editor { min-height:170px; display:flex; flex-wrap:wrap; align-items:center; gap:6px; font-size:34px; line-height:1.2; }
+      .node { display:inline-flex; align-items:center; border-radius:8px; padding:2px 4px; border:1px solid transparent; }
+      .node.active { border-color:#6ba3ff; box-shadow:0 0 0 1px #6ba3ff66; animation:pulse 1s infinite; }
+      .placeholder{ min-width:28px; min-height:36px; border:2px dashed #728be6; background:#1f2c59; border-radius:8px; }
+      .placeholder.active{ border-color:#73f6ff; box-shadow:0 0 0 2px #73f6ff4d; animation:pulse 1s infinite; }
+      .fraction{ display:inline-flex; flex-direction:column; align-items:center; padding:2px 6px; }
+      .frac-line{ width:100%; height:2px; background:#d9e2ff; }
+      .exp-wrap{ display:inline-flex; align-items:flex-start; }
+      .exp-sup{ font-size:.62em; margin-left:2px; transform: translateY(-10px); }
+      .root-wrap{ display:inline-flex; align-items:flex-start; }
+      .root-radicand{ border-top:2px solid #d9e2ff; padding-left:6px; margin-left:3px; }
+      .paren { padding:0 2px; font-size:1.05em; }
+      .results .src { font-size:12px; opacity:.8; }
+      .kbd { position:fixed; bottom:0; left:0; right:0; z-index:15; background:#101836; border-top:1px solid #2a3768; padding:10px; }
+      .kbd-grid{ max-width:920px; margin:0 auto; display:grid; gap:6px; }
+      .row{ display:grid; gap:6px; }
+      .r1{ grid-template-columns: repeat(5,1fr); }
+      .r2,.r3,.r4{ grid-template-columns: repeat(4,1fr); }
+      .r5{ grid-template-columns: repeat(3,1fr); }
+      .drawer{ position:fixed; right:0; top:70px; width:min(88vw,360px); max-height:55vh; overflow:auto; background:#0f1732; border-left:1px solid #2f3f80; border-bottom:1px solid #2f3f80; padding:12px; z-index:30; }
+      .hist-item{ width:100%; text-align:left; margin-bottom:6px; background:#1a2753; }
+      .ok{ color:#6ff7b0; font-size:13px; }
+      .err{ color:#ff8f8f; font-size:13px; }
+      @keyframes pulse{ 0%{box-shadow:0 0 0 0 #62b1ff60;} 70%{box-shadow:0 0 0 8px transparent;} 100%{box-shadow:0 0 0 0 transparent;} }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import React, { useEffect, useMemo, useRef, useState } from 'https://esm.sh/react@18.3.1';
+      import { createRoot } from 'https://esm.sh/react-dom@18.3.1/client';
+
+      const id = () => Math.random().toString(36).slice(2, 11);
+      const mk = (type, value = null, children = []) => ({ id: id(), type, value, children });
+      const placeholder = () => mk('placeholder', null, []);
+      const clone = (x) => JSON.parse(JSON.stringify(x));
+
+      const initialAst = mk('equation', null, [placeholder(), placeholder()]);
+
+      function flattenEditable(node, acc = []) {
+        if (['number','variable','operator','placeholder'].includes(node.type)) acc.push(node.id);
+        for (const c of node.children || []) flattenEditable(c, acc);
+        return acc;
+      }
+      function serializeAst(node) {
+        const walk = (n) => {
+          switch(n.type){
+            case 'number': case 'variable': return n.value || '_';
+            case 'operator': return ` ${n.value} `;
+            case 'placeholder': return '□';
+            case 'fraction': return `(${walk(n.children[0])})/(${walk(n.children[1])})`;
+            case 'exponent': return `${walk(n.children[0])}^(${walk(n.children[1])})`;
+            case 'root': return `sqrt(${walk(n.children[0])})`;
+            case 'parentheses': return `(${walk(n.children[0])})`;
+            case 'equation': return `${walk(n.children[0])} = ${walk(n.children[1])}`;
+            default: return (n.children||[]).map(walk).join('');
+          }
+        };
+        return walk(node);
+      }
+      function mapTree(node, fn){
+        const next = fn({ ...node, children: (node.children || []).map((c)=>mapTree(c, fn)) });
+        return next;
+      }
+      function replaceNode(root, targetId, builder){
+        return mapTree(root, (n)=> n.id === targetId ? builder(n) : n);
+      }
+
+      function insertAtPlaceholder(ast, cursorId, nodeToInsert) {
+        let newAst = ast;
+        newAst = replaceNode(newAst, cursorId, () => nodeToInsert);
+        return newAst;
+      }
+      function findNode(root, targetId){
+        if(root.id===targetId) return root;
+        for(const c of root.children||[]){ const f = findNode(c, targetId); if(f) return f; }
+        return null;
+      }
+      function firstPlaceholder(node){
+        if(node.type==='placeholder') return node.id;
+        for(const c of node.children||[]){ const f=firstPlaceholder(c); if(f) return f; }
+        return null;
+      }
+
+      function App(){
+        const [apiInput, setApiInput] = useState('');
+        const [geminiApiKey, setGeminiApiKey] = useState('');
+        const [keyStatus, setKeyStatus] = useState('');
+        const [ast, setAst] = useState(initialAst);
+        const [cursorId, setCursorId] = useState(initialAst.children[0].id);
+        const [result, setResult] = useState({ resultado:'', formas:[], tipo:'expressao', source:'local' });
+        const [loading, setLoading] = useState(false);
+        const [history, setHistory] = useState([]);
+        const [showHistory, setShowHistory] = useState(false);
+        const [undoStack, setUndoStack] = useState([]);
+        const [redoStack, setRedoStack] = useState([]);
+        const abortRef = useRef(null);
+
+        const editableIds = useMemo(()=>flattenEditable(ast), [ast]);
+
+        const snapshot = (nextAst) => {
+          setUndoStack((s)=>[...s, clone(ast)].slice(-60));
+          setRedoStack([]);
+          setAst(nextAst);
+        };
+
+        const moveCursor = (dir) => {
+          const idx = editableIds.indexOf(cursorId);
+          if (idx < 0) return;
+          const n = editableIds[idx + dir];
+          if (n) setCursorId(n);
+        };
+
+        const applyInsert = (kind, value='') => {
+          const active = findNode(ast, cursorId);
+          if (!active) return;
+          let newNode;
+          if(kind==='number') newNode = mk('number', value, []);
+          if(kind==='variable') newNode = mk('variable', value, []);
+          if(kind==='operator') newNode = mk('operator', value, []);
+          if(kind==='equation') newNode = mk('equation', null, [placeholder(), placeholder()]);
+          if(kind==='fraction') newNode = mk('fraction', null, [placeholder(), placeholder()]);
+          if(kind==='exponent') newNode = mk('exponent', null, [placeholder(), placeholder()]);
+          if(kind==='root') newNode = mk('root', null, [placeholder()]);
+          if(kind==='parentheses') newNode = mk('parentheses', null, [placeholder()]);
+          if (!newNode) return;
+          const updated = insertAtPlaceholder(ast, cursorId, newNode);
+          snapshot(updated);
+          setTimeout(()=>{
+            const nxt = firstPlaceholder(findNode(updated,newNode.id)) || editableIds[editableIds.indexOf(cursorId)+1];
+            setCursorId(nxt || newNode.id);
+          },0);
+        };
+
+        const removeCurrent = () => {
+          const updated = replaceNode(ast, cursorId, () => placeholder());
+          snapshot(updated);
+        };
+
+        const handleAction = (action) => {
+          if(/^num:\d$/.test(action)) return applyInsert('number', action.split(':')[1]);
+          if(action==='num:.') return applyInsert('number','.');
+          if(/^var:/.test(action)) return applyInsert('variable', action.split(':')[1]);
+          if(/^op:/.test(action)) return applyInsert('operator', action.split(':')[1]);
+          if(action==='fraction') return applyInsert('fraction');
+          if(action==='exponent') return applyInsert('exponent');
+          if(action==='root') return applyInsert('root');
+          if(action==='parentheses') return applyInsert('parentheses');
+          if(action==='equation') return applyInsert('equation');
+          if(action==='left') return moveCursor(-1);
+          if(action==='right') return moveCursor(1);
+          if(action==='backspace') return removeCurrent();
+          if(action==='undo') return setUndoStack((u)=>{ if(!u.length) return u; const prev=u[u.length-1]; setRedoStack((r)=>[clone(ast),...r]); setAst(prev); setCursorId(flattenEditable(prev)[0]); return u.slice(0,-1); });
+          if(action==='redo') return setRedoStack((r)=>{ if(!r.length) return r; const next=r[0]; setUndoStack((u)=>[...u,clone(ast)]); setAst(next); setCursorId(flattenEditable(next)[0]); return r.slice(1); });
+          if(action==='submit') return resolveExpression(true);
+        };
+
+        useEffect(()=>{
+          const onKey = (e) => {
+            if (e.target.tagName === 'INPUT') return;
+            if (e.ctrlKey && e.key.toLowerCase()==='z'){ e.preventDefault(); return handleAction('undo'); }
+            if (e.ctrlKey && e.key.toLowerCase()==='y'){ e.preventDefault(); return handleAction('redo'); }
+            if (/^[0-9]$/.test(e.key)) return handleAction(`num:${e.key}`);
+            if (/^[a-z]$/i.test(e.key)) return handleAction(`var:${e.key.toLowerCase()}`);
+            if (e.key === '+') return handleAction('op:+');
+            if (e.key === '-') return handleAction('op:-');
+            if (e.key === '*') return handleAction('op:×');
+            if (e.key === '/') return handleAction('fraction');
+            if (e.key === '=') return handleAction('equation');
+            if (e.key === 'ArrowLeft') return handleAction('left');
+            if (e.key === 'ArrowRight') return handleAction('right');
+            if (e.key === 'Backspace') return handleAction('backspace');
+            if (e.key === 'Enter') return handleAction('submit');
+          };
+          addEventListener('keydown', onKey);
+          return ()=>removeEventListener('keydown', onKey);
+        }, [ast, cursorId, editableIds]);
+
+        function numericEval(n){
+          if(n.type==='number') return Number(n.value);
+          if(n.type==='fraction') return numericEval(n.children[0]) / numericEval(n.children[1]);
+          if(n.type==='operator') return n.value;
+          if(n.type==='parentheses') return numericEval(n.children[0]);
+          if(n.type==='placeholder') return NaN;
+          return NaN;
+        }
+        function equationSolve(root){
+          const s = serializeAst(root).replaceAll(' ','');
+          const m = s.match(/^x\^\(([-\d.]+)\)([+\-]\d+)?=([\-\d.]+)$/) || s.match(/^x\^2([+\-]\d+)?=([\-\d.]+)$/);
+          if(!m) return null;
+          const b = Number(m[1] && m[1] !== '2' ? m[1] : 0);
+          const rhs = Number(m[2] || m[3]);
+          const c = -rhs;
+          const a = 1;
+          const d = b*b - 4*a*c;
+          if(d < 0) return { resultado:'sem solução real', formas:[], tipo:'equacao', source:'local' };
+          const x1 = (-b + Math.sqrt(d))/2;
+          const x2 = (-b - Math.sqrt(d))/2;
+          return { resultado:`x = ${x1} e x = ${x2}`, formas:[`x₁=${x1}`,`x₂=${x2}`], tipo:'equacao', source:'local' };
+        }
+        function localEngine(root){
+          const eq = equationSolve(root);
+          if(eq) return eq;
+          if(root.type==='fraction'){
+            const a = numericEval(root.children[0]), b = numericEval(root.children[1]);
+            if(!Number.isNaN(a) && !Number.isNaN(b) && b!==0) return {resultado:String(a/b), formas:[`${a}/${b}`], tipo:'expressao', source:'local'};
+          }
+          return null;
+        }
+
+        async function callGemini(serialized){
+          if(!geminiApiKey) return setResult({resultado:'Configure a chave Gemini no topo', formas:[], tipo:'expressao', source:'erro'});
+          try {
+            abortRef.current?.abort();
+            abortRef.current = new AbortController();
+            setLoading(true);
+            const prompt = `Você é um motor matemático. Receberá uma expressão ou equação matemática e deve retornar APENAS um JSON válido, sem markdown, sem explicação, no formato: { "resultado": "...", "formas": ["forma 1", "forma 2"], "tipo": "equacao" | "expressao" | "simplificacao" }. Expressão: ${serialized}`;
+            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key=${geminiApiKey}`, {
+              method:'POST',
+              signal: abortRef.current.signal,
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({contents:[{parts:[{text:prompt}]}]})
+            });
+            if(!res.ok) throw new Error('api');
+            const data = await res.json();
+            const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+            const cleaned = text.replace(/^```json|```$/g,'').trim();
+            const parsed = JSON.parse(cleaned);
+            setResult({...parsed, source:'gemini'});
+          } catch {
+            setResult({resultado:'Erro na API — verifique a chave', formas:[], tipo:'expressao', source:'erro'});
+          } finally { setLoading(false); }
+        }
+
+        const resolveExpression = (forceGemini=false) => {
+          const serialized = serializeAst(ast);
+          const local = localEngine(ast);
+          if(local && !forceGemini){
+            setResult(local);
+            setHistory((h)=>[{ast:clone(ast), text:serialized, result:local.resultado}, ...h].slice(0,20));
+            return;
+          }
+          callGemini(serialized);
+          setHistory((h)=>[{ast:clone(ast), text:serialized, result:'gemini'}, ...h].slice(0,20));
+        };
+
+        useEffect(()=>{
+          const t = setTimeout(()=>resolveExpression(false), 200);
+          return ()=>clearTimeout(t);
+        }, [ast]);
+
+        const saveKey = () => { setGeminiApiKey(apiInput.trim()); setKeyStatus('saved'); setTimeout(()=>setKeyStatus(''),1200); };
+        const resetKey = () => { setGeminiApiKey(''); setApiInput(''); setKeyStatus('reset'); };
+        const testKey = async () => {
+          if(!geminiApiKey) return setKeyStatus('invalid');
+          try{
+            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key=${geminiApiKey}`, {
+              method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({contents:[{parts:[{text:'1+1? responda em 2 chars'}]}]})
+            });
+            setKeyStatus(res.ok ? 'valid' : 'invalid');
+          }catch{ setKeyStatus('invalid'); }
+        };
+
+        const renderNode = (node) => {
+          const active = cursorId===node.id;
+          const click = () => setCursorId(node.id);
+          if(node.type==='placeholder') return <span key={node.id} className={`node placeholder ${active?'active':''}`} onClick={click}></span>;
+          if(node.type==='number' || node.type==='variable' || node.type==='operator') return <span key={node.id} className={`node ${active?'active':''}`} onClick={click}>{node.value}</span>;
+          if(node.type==='fraction') return <span key={node.id} className={`node fraction ${active?'active':''}`} onClick={click}><span>{renderNode(node.children[0])}</span><span className='frac-line'></span><span>{renderNode(node.children[1])}</span></span>;
+          if(node.type==='exponent') return <span key={node.id} className={`node exp-wrap ${active?'active':''}`} onClick={click}><span>{renderNode(node.children[0])}</span><sup className='exp-sup'>{renderNode(node.children[1])}</sup></span>;
+          if(node.type==='root') return <span key={node.id} className={`node root-wrap ${active?'active':''}`} onClick={click}><span>√</span><span className='root-radicand'>{renderNode(node.children[0])}</span></span>;
+          if(node.type==='parentheses') return <span key={node.id} className={`node ${active?'active':''}`} onClick={click}><span className='paren'>(</span>{renderNode(node.children[0])}<span className='paren'>)</span></span>;
+          if(node.type==='equation') return <span key={node.id} className={`node ${active?'active':''}`} onClick={click}>{renderNode(node.children[0])}<span className='node'>=</span>{renderNode(node.children[1])}</span>;
+          return <span key={node.id}>{(node.children||[]).map(renderNode)}</span>;
+        };
+
+        const keyRows = [
+          { cls:'r1', keys:[['←','left'],['→','right'],['⌫','backspace'],['↩','undo'],['↪','redo']]},
+          { cls:'r2', keys:[['a/b','fraction'],['xⁿ','exponent'],['√','root'],['( )','parentheses']]},
+          { cls:'r3', keys:[['+','op:+'],['-','op:-'],['×','op:×'],['÷','op:÷'],['=','equation']]},
+          { cls:'r4', keys:[['x','var:x'],['y','var:y'],['π','var:π']]},
+        ];
+
+        return <div className='app'>
+          <div className='topbar'>
+            <input value={apiInput} onChange={(e)=>setApiInput(e.target.value)} placeholder='Cole a chave Gemini'/>
+            <button onClick={saveKey}>Salvar</button>
+            <button onClick={testKey}>Testar</button>
+            <button onClick={resetKey}>Resetar</button>
+            <button onClick={()=>setShowHistory((v)=>!v)}>🕐</button>
+          </div>
+          <div className='container'>
+            <div className='panel'>
+              {keyStatus==='saved' && <div className='ok'>✅ Chave salva</div>}
+              {keyStatus==='valid' && <div className='ok'>✅ Chave válida</div>}
+              {keyStatus==='invalid' && <div className='err'>❌ Chave inválida</div>}
+              {keyStatus==='reset' && <div className='err'>Chave resetada</div>}
+              <div className='editor'>{renderNode(ast)}</div>
+            </div>
+            <div className='panel results'>
+              <div><strong>Resultado:</strong> {loading ? 'calculando...' : (result.resultado || '—')}</div>
+              {!!result.formas?.length && <ul>{result.formas.map((f,i)=><li key={i}>{f}</li>)}</ul>}
+              <div className='src'>Fonte: {result.source || 'local'}</div>
+            </div>
+          </div>
+          {showHistory && <div className='drawer'>
+            {history.map((h,i)=><button key={i} className='hist-item' onClick={()=>{setAst(clone(h.ast)); setCursorId(flattenEditable(h.ast)[0]);}}>{h.text}<br/><small>{h.result}</small></button>)}
+          </div>}
+          <div className='kbd'>
+            <div className='kbd-grid'>
+              {keyRows.map((row, idx)=><div key={idx} className={`row ${row.cls}`}>{row.keys.map(([label,act])=><button key={label} onClick={()=>handleAction(act)}>{label}</button>)}</div>)}
+              <div className='row r5'>
+                {[7,8,9,4,5,6,1,2,3,0,'.','( )'].map((k,i)=><button key={i} onClick={()=>handleAction(k==='( )'?'parentheses':`num:${k}`)}>{k}</button>)}
+              </div>
+            </div>
+          </div>
+        </div>;
+      }
+
+      createRoot(document.getElementById('root')).render(<App />);
+
+      if ('serviceWorker' in navigator) {
+        const sw = `self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>clients.claim());`;
+        navigator.serviceWorker.register(URL.createObjectURL(new Blob([sw], { type: 'text/javascript' })));
+      }
+    </script>
+  </body>
+</html>
